@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.DS_Store
+# 审计运行产物（应留在各 case 目录，不入 skill 仓库）
+audit_inputs.json
+audit_bundle.json
+completeness.json
+structure_diff.json
+style_diff.json
+_grid/
+_cmp/
+_shots/
