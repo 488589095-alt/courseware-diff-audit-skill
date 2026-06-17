@@ -26,6 +26,7 @@ import locate_inputs
 import completeness_audit
 import structure_reconcile
 import style_fidelity
+import layout_check
 import visual_compose
 
 
@@ -45,14 +46,25 @@ def _ensure_dump(src_pptx_or_docx, kind, out_txt):
 
 
 def _screenshot(pptx, out_dir):
-    import take_screenshots
-    return take_screenshots.run(str(pptx), str(out_dir))
+    """优先 PowerPoint+Quartz；失败（无 PowerPoint/PyObjC）回退 LibreOffice+PyMuPDF。"""
+    try:
+        import take_screenshots
+        return take_screenshots.run(str(pptx), str(out_dir))
+    except Exception as e:
+        print(f"  △ PowerPoint/Quartz 渲染不可用({e})，回退 LibreOffice…")
+        import render_slides
+        return render_slides.run(str(pptx), str(out_dir))
 
 
 def _pdf_screens(pdf, out_dir):
-    import take_screenshots
+    """PDF → PNG（优先 PyMuPDF，免 PyObjC；回退 Quartz）。"""
     Path(out_dir).mkdir(parents=True, exist_ok=True)
-    return take_screenshots._pdf_to_png(str(pdf), str(out_dir))
+    try:
+        import render_slides
+        return render_slides.pdf_to_pngs(str(pdf), str(out_dir))
+    except Exception:
+        import take_screenshots
+        return take_screenshots._pdf_to_png(str(pdf), str(out_dir))
 
 
 def select_pairs(structure_diff, max_pairs=12):
@@ -81,7 +93,12 @@ def select_pairs(structure_diff, max_pairs=12):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--case", required=True)
-    ap.add_argument("--courseware", default=None, help="指定课件版本（默认最新 vN）")
+    ap.add_argument("--courseware", default=None, help="显式指定生成课件 pptx（默认自动取最新 vN）")
+    ap.add_argument("--benchmark", default=None, help="显式指定标杆 pptx/dump（绕过自动识别，应对命名陷阱如「标杆风」）")
+    ap.add_argument("--handout", default=None, help="显式指定讲义 docx/dump")
+    ap.add_argument("--template-spec", default=None, help="显式指定 template_spec.json 或模版 pptx")
+    ap.add_argument("--cw-pdf", default=None, help="课件的预导出 PDF（如 WPS「输出为PDF」）→ 字体保真渲染，绕过 soffice")
+    ap.add_argument("--bm-pdf", default=None, help="标杆的预导出 PDF → 字体保真渲染")
     ap.add_argument("--no-screenshots", action="store_true")
     a = ap.parse_args()
 
@@ -94,25 +111,37 @@ def main():
     (case / "audit_inputs.json").write_text(json.dumps(inp, ensure_ascii=False, indent=2),
                                             encoding="utf-8")
 
+    # 显式参数优先于自动识别（应对任意命名 / 命名陷阱）
     cw_pptx = a.courseware or inp["courseware"]["latest"]
     if not cw_pptx:
         sys.exit("❌ 无课件可对比")
     cw_pptx = Path(cw_pptx)
-    handout = inp["handout"]["live"] or inp["handout"]["dump"]
-    bench = inp["benchmark"]["live"] or inp["benchmark"]["dump"]
-    bench_live = inp["benchmark"]["live"]
-    bench_pdf = inp["benchmark"]["pdf"]
-    tspec = inp["template"]["spec_json"]
-    if not tspec and inp["template"]["live"]:
+    handout = a.handout or inp["handout"]["live"] or inp["handout"]["dump"]
+    if a.benchmark:
+        bench = a.benchmark
+        bench_live = a.benchmark if str(a.benchmark).lower().endswith(".pptx") else None
+        bench_pdf = a.benchmark if str(a.benchmark).lower().endswith(".pdf") else None
+    else:
+        bench = inp["benchmark"]["live"] or inp["benchmark"]["dump"]
+        bench_live = inp["benchmark"]["live"]
+        bench_pdf = inp["benchmark"]["pdf"]
+    if a.benchmark or a.handout or a.courseware or a.template_spec:
+        print("  (使用显式指定的输入，已覆盖自动识别)")
+
+    tspec = a.template_spec or inp["template"]["spec_json"]
+    tmpl_live = (a.template_spec if (a.template_spec and str(a.template_spec).lower().endswith(".pptx"))
+                 else inp["template"]["live"])
+    if (not tspec or str(tspec).lower().endswith(".pptx")) and tmpl_live:
         try:
-            import dissect_template  # noqa
             import subprocess
             subprocess.run([sys.executable, str(SKILL_DIR / "dissect_template.py"),
-                            inp["template"]["live"], "-o", str(case)], timeout=120)
+                            tmpl_live, "-o", str(case)], timeout=120)
             if (case / "template_spec.json").exists():
                 tspec = str(case / "template_spec.json")
         except Exception as e:
             print(f"  △ 模版拆解失败: {e}")
+    if tspec and str(tspec).lower().endswith(".pptx"):
+        tspec = None   # 没拆成 spec 就置空，style 基准退化为仅标杆
 
     bundle = {"case": str(case), "case_name": case.name, "inputs": inp,
               "courseware_used": str(cw_pptx), "artifacts": {}, "errors": []}
@@ -165,6 +194,19 @@ def main():
         bundle["errors"].append(f"style: {e}")
         print(f"  ✗ 样式失败: {e}")
 
+    # 排版错位机械检测（字体度量，不依赖渲染——能抓到渲染会掩盖的字体溢出）
+    try:
+        lay = layout_check.check(str(cw_pptx))
+        (case / "layout_issues.json").write_text(json.dumps(lay, ensure_ascii=False, indent=1),
+                                                 encoding="utf-8")
+        bundle["artifacts"]["layout_issues"] = str(case / "layout_issues.json")
+        ls = lay["summary"]
+        print(f"  排版: {ls['overflow_shapes']} 处文字溢出嫌疑 (页 {ls['slides_with_overflow']}); "
+              f"{ls['offcanvas_shapes']} 处形状越界(图片/背景出血常见，逐条看 layout_issues.json)")
+    except Exception as e:
+        bundle["errors"].append(f"layout: {e}")
+        print(f"  ✗ 排版检测失败: {e}")
+
     # ── 阶段3 视觉渲染对比 ──
     print(f"\n{'─'*60}\n[3/4] 视觉渲染")
     cw_png = case / "_shots" / "课件"
@@ -173,15 +215,25 @@ def main():
     if a.no_screenshots:
         print("  跳过渲染 (--no-screenshots)")
     else:
+        # 课件：优先用 --cw-pdf（WPS 导出，字体保真），否则 soffice/PowerPoint 渲 pptx
         try:
-            _screenshot(cw_pptx, cw_png)
+            if a.cw_pdf:
+                print(f"  课件用预导出 PDF（字体保真）: {Path(a.cw_pdf).name}")
+                _pdf_screens(a.cw_pdf, cw_png)
+            else:
+                _screenshot(cw_pptx, cw_png)
             bundle["artifacts"]["screenshots_courseware"] = str(cw_png)
         except Exception as e:
             bundle["errors"].append(f"screenshot_cw: {e}")
-            print(f"  ✗ 课件截图失败(需PowerPoint): {e}")
-        # 标杆截图：优先 live pptx，其次 pdf
+            print(f"  ✗ 课件渲染失败: {e}")
+        # 标杆：优先 --bm-pdf，其次 live pptx，其次已有 pdf
         try:
-            if bench_live:
+            bm_pdf_src = a.bm_pdf or bench_pdf
+            if a.bm_pdf:
+                print(f"  标杆用预导出 PDF（字体保真）: {Path(a.bm_pdf).name}")
+                _pdf_screens(a.bm_pdf, bm_png)
+                bundle["artifacts"]["screenshots_benchmark"] = str(bm_png)
+            elif bench_live:
                 _screenshot(bench_live, bm_png)
                 bundle["artifacts"]["screenshots_benchmark"] = str(bm_png)
             elif bench_pdf:
@@ -191,7 +243,7 @@ def main():
                 print("  △ 标杆无 pptx/pdf，仅 dump → 无标杆截图（无法并排，仅课件网格）")
         except Exception as e:
             bundle["errors"].append(f"screenshot_bm: {e}")
-            print(f"  ✗ 标杆截图失败: {e}")
+            print(f"  ✗ 标杆渲染失败: {e}")
         # 拼图
         try:
             pairs = select_pairs(structure_diff)
